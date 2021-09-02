@@ -70,6 +70,18 @@ static ZDriverRequest rule_warmup() {
     return GCCause::_no_gc;
   }
 
+  if (ZProactive) {
+    // The concept of warm-up is ill-defined when our goal is to minimize the peak committed memory.
+    if (!ZStatCycle::is_last_used_trustable()) {
+      // We will simply run a single GC immediately at the start to get a baseline heap size.
+      return GCCause::_z_warmup;
+    }
+    else {
+      // Rule disabled
+      return GCCause::_no_gc;
+    }
+  }
+
   // Perform GC if heap usage passes 10/20/30% and no other GC has been
   // performed yet. This allows us to get some early samples of the GC
   // duration, which is needed by the other rules.
@@ -88,26 +100,6 @@ static ZDriverRequest rule_warmup() {
   return GCCause::_z_warmup;
 }
 
-static ZDriverRequest rule_timer() {
-  if (ZCollectionInterval <= 0) {
-    // Rule disabled
-    return GCCause::_no_gc;
-  }
-
-  // Perform GC if timer has expired.
-  const double time_since_last_gc = ZStatCycle::time_since_last();
-  const double time_until_gc = ZCollectionInterval - time_since_last_gc;
-
-  log_debug(gc, director)("Rule: Timer, Interval: %.3fs, TimeUntilGC: %.3fs",
-                          ZCollectionInterval, time_until_gc);
-
-  if (time_until_gc > 0) {
-    return GCCause::_no_gc;
-  }
-
-  return GCCause::_z_timer;
-}
-
 static double estimated_gc_workers(double serial_gc_time, double parallelizable_gc_time, double time_until_deadline) {
   const double parallelizable_time_until_deadline = MAX2(time_until_deadline - serial_gc_time, 0.001);
   return parallelizable_gc_time / parallelizable_time_until_deadline;
@@ -119,9 +111,9 @@ static uint discrete_gc_workers(double gc_workers) {
 
 static double select_gc_workers(double serial_gc_time, double parallelizable_gc_time, double alloc_rate_sd_percent, double time_until_oom) {
   // Use all workers until we're warm
-  if (!ZStatCycle::is_warm()) {
+  if (!ZStatCycle::is_time_trustable()) {
     const double not_warm_gc_workers = ConcGCThreads;
-    log_debug(gc, director)("Select GC Workers (Not Warm), GCWorkers: %.3f", not_warm_gc_workers);
+    log_trace(gc, director)("Select GC Workers (Not Warm), GCWorkers: %.3f", not_warm_gc_workers);
     return not_warm_gc_workers;
   }
 
@@ -133,11 +125,11 @@ static double select_gc_workers(double serial_gc_time, double parallelizable_gc_
   const uint actual_gc_workers = discrete_gc_workers(gc_workers);
   const uint last_gc_workers = ZStatCycle::last_active_workers();
 
-  // More than 15% division from the average is considered unsteady
+  // More than 15% deviation from the average is considered unsteady
   if (alloc_rate_sd_percent >= 0.15) {
     const double half_gc_workers = ConcGCThreads / 2.0;
     const double unsteady_gc_workers = MAX3<double>(gc_workers, last_gc_workers, half_gc_workers);
-    log_debug(gc, director)("Select GC Workers (Unsteady), "
+    log_trace(gc, director)("Select GC Workers (Unsteady), "
                             "AvoidLongGCWorkers: %.3f, AvoidOOMGCWorkers: %.3f, LastGCWorkers: %.3f, HalfGCWorkers: %.3f, GCWorkers: %.3f",
                             avoid_long_gc_workers, avoid_oom_gc_workers, (double)last_gc_workers, half_gc_workers, unsteady_gc_workers);
     return unsteady_gc_workers;
@@ -156,13 +148,13 @@ static double select_gc_workers(double serial_gc_time, double parallelizable_gc_
     const double next_gc_workers = next_avoid_oom_gc_workers + 0.5;
     const double try_lowering_gc_workers = clamp<double>(next_gc_workers, actual_gc_workers, last_gc_workers);
 
-    log_debug(gc, director)("Select GC Workers (Try Lowering), "
+    log_trace(gc, director)("Select GC Workers (Try Lowering), "
                            "AvoidLongGCWorkers: %.3f, AvoidOOMGCWorkers: %.3f, NextAvoidOOMGCWorkers: %.3f, LastGCWorkers: %.3f, GCWorkers: %.3f",
                             avoid_long_gc_workers, avoid_oom_gc_workers, next_avoid_oom_gc_workers, (double)last_gc_workers, try_lowering_gc_workers);
     return try_lowering_gc_workers;
   }
 
-  log_debug(gc, director)("Select GC Workers (Normal), "
+  log_trace(gc, director)("Select GC Workers (Normal), "
                          "AvoidLongGCWorkers: %.3f, AvoidOOMGCWorkers: %.3f, LastGCWorkers: %.3f, GCWorkers: %.3f",
                          avoid_long_gc_workers, avoid_oom_gc_workers, (double)last_gc_workers, gc_workers);
   return gc_workers;
@@ -319,7 +311,7 @@ static ZDriverRequest rule_high_usage() {
 }
 
 static ZDriverRequest rule_proactive() {
-  if (!ZProactive || !ZStatCycle::is_warm()) {
+  if (!ZProactive || !ZStatCycle::is_last_used_trustable()) {
     // Rule disabled
     return GCCause::_no_gc;
   }
@@ -333,36 +325,72 @@ static ZDriverRequest rule_proactive() {
   // 10% of the max capacity since the previous GC, or more than 5 minutes has
   // passed since the previous GC. This helps avoid superfluous GCs when running
   // applications with very low allocation rate.
-  const size_t used_after_last_gc = ZStatHeap::used_at_relocate_end();
-  const size_t used_increase_threshold = ZHeap::heap()->soft_max_capacity() * 0.10; // 10%
-  const size_t used_threshold = used_after_last_gc + used_increase_threshold;
-  const size_t used = ZHeap::heap()->used();
+  const size_t used_baseline = MIN2(ZStatHeap::used_at_mark_start(), ZStatHeap::used_at_relocate_end());
+  const size_t used_increase = ZHeap::heap()->used() - used_baseline;
+  // We want to replace `0.20` with ZCollectionIntervalRatio
+  // and `ZHeap::heap()->soft_max_capacity() * 0.10` with ZCollectionIntervalBytes
+  // We don't want any heuristics based on `soft_max_capacity`, but for now I leave it
+  const size_t used_increase_threshold = MIN2(used_baseline * 0.20, ZHeap::heap()->soft_max_capacity() * 0.10);
+  const int64_t used_increase_remaining = used_increase_threshold - used_increase;
   const double time_since_last_gc = ZStatCycle::time_since_last();
-  const double time_since_last_gc_threshold = 5 * 60; // 5 minutes
-  if (used < used_threshold && time_since_last_gc < time_since_last_gc_threshold) {
-    // Don't even consider doing a proactive GC
-    log_debug(gc, director)("Rule: Proactive, UsedUntilEnabled: " SIZE_FORMAT "MB, TimeUntilEnabled: %.3fs",
-                            (used_threshold - used) / M,
-                            time_since_last_gc_threshold - time_since_last_gc);
-    return GCCause::_no_gc;
-  }
+  const double time_since_last_gc_threshold = ZCollectionInterval;
 
-  const double assumed_throughput_drop_during_gc = 0.50; // 50%
-  const double acceptable_throughput_drop = 0.01;        // 1%
+  const bool very_proactive = false;
+
+  const double alloc_rate_predict = ZStatAllocRate::predict();
+  const double alloc_rate_avg = ZStatAllocRate::avg();
+  const double alloc_rate_sd = ZStatAllocRate::sd();
+  const double alloc_rate_sd_percent = alloc_rate_sd / (alloc_rate_avg + 1.0);
+  const double alloc_rate = very_proactive
+          ? (MAX2(alloc_rate_predict, alloc_rate_avg) * ZAllocationSpikeTolerance) + (alloc_rate_sd * one_in_1000) + 1.0
+          : alloc_rate_predict;
+
+  const double time_until_next_cycle = very_proactive
+          ? (used_increase_remaining / alloc_rate) / (1.0 + alloc_rate_sd_percent)
+          : used_increase_threshold / alloc_rate;
+
   const double serial_gc_time = ZStatCycle::serial_time().davg() + (ZStatCycle::serial_time().dsd() * one_in_1000);
   const double parallelizable_gc_time = ZStatCycle::parallelizable_time().davg() + (ZStatCycle::parallelizable_time().dsd() * one_in_1000);
-  const double gc_duration = serial_gc_time + (parallelizable_gc_time / ConcGCThreads);
-  const double acceptable_gc_interval = gc_duration * ((assumed_throughput_drop_during_gc / acceptable_throughput_drop) - 1.0);
-  const double time_until_gc = acceptable_gc_interval - time_since_last_gc;
 
-  log_debug(gc, director)("Rule: Proactive, AcceptableGCInterval: %.3fs, TimeSinceLastGC: %.3fs, TimeUntilGC: %.3fs",
-                          acceptable_gc_interval, time_since_last_gc, time_until_gc);
+  // Calculate number of GC workers needed to finish GC before next cycle.
+  const double gc_workers = select_gc_workers(serial_gc_time, parallelizable_gc_time, alloc_rate_sd_percent, time_until_next_cycle);
+  const uint actual_gc_workers = discrete_gc_workers(gc_workers);
 
-  if (time_until_gc > 0) {
-    return GCCause::_no_gc;
+  // Calculate GC duration given number of GC workers needed.
+  const double actual_gc_duration = serial_gc_time + (parallelizable_gc_time / actual_gc_workers);
+  const uint last_gc_workers = ZStatCycle::last_active_workers();
+
+  // Calculate time until GC given the time until OOM and GC duration.
+  // We also subtract the sample interval, so that we don't overshoot the
+  // target time and end up starting the GC too late in the next interval.
+  const double time_until_gc = very_proactive
+          ? (MIN2(time_until_next_cycle - actual_gc_duration - sample_interval, time_since_last_gc_threshold - time_since_last_gc))
+          : time_since_last_gc_threshold - time_since_last_gc;
+
+  log_debug(gc, director)("Rule: Proactive (Dynamic GC Workers), "
+                          "TimeSinceLastGC: %.3fs, "
+                          "MaxAllocRate: %.1fMB/s (+/-%.1f%%), "
+                          "LastUsed: " SIZE_FORMAT "MB, AddlUsed: " SIZE_FORMAT "MB, UsedThresh: " SIZE_FORMAT "MB, "
+                          "GCCPUTime: %.3f, GCDuration: %.3fs, TimeUntilNextCycle: %.3fs, TimeUntilGC: %.3fs, "
+                          "GCWorkers: %u -> %u",
+                          time_since_last_gc,
+                          alloc_rate / M,
+                          alloc_rate_sd_percent * 100,
+                          used_baseline / M,
+                          used_increase / M,
+                          used_increase_threshold / M,
+                          serial_gc_time + parallelizable_gc_time,
+                          serial_gc_time + (parallelizable_gc_time / actual_gc_workers),
+                          time_until_next_cycle,
+                          time_until_gc,
+                          last_gc_workers,
+                          actual_gc_workers);
+
+  if (actual_gc_workers <= last_gc_workers && used_increase < used_increase_threshold && time_until_gc > 0) {
+      return ZDriverRequest(GCCause::_no_gc, actual_gc_workers);
   }
 
-  return GCCause::_z_proactive;
+  return ZDriverRequest(GCCause::_z_proactive, actual_gc_workers);
 }
 
 static ZDriverRequest make_gc_decision() {
@@ -371,10 +399,9 @@ static ZDriverRequest make_gc_decision() {
   const ZDirectorRule rules[] = {
     rule_allocation_stall,
     rule_warmup,
-    rule_timer,
+    rule_proactive,
     rule_allocation_rate,
     rule_high_usage,
-    rule_proactive,
   };
 
   // Execute rules

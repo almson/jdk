@@ -1104,6 +1104,12 @@ bool ZStatCycle::is_time_trustable() {
   return _nwarmup_cycles > 0;
 }
 
+bool ZStatCycle::is_last_used_trustable() {
+    // The bytes used are considered trustable if we
+    // have completed at least one warmup cycle.
+    return _nwarmup_cycles > 0;
+}
+
 const AbsSeq& ZStatCycle::serial_time() {
   return _serial_time;
 }

@@ -386,6 +386,7 @@ public:
   static uint64_t nwarmup_cycles();
 
   static bool is_time_trustable();
+  static bool is_last_used_trustable();
   static const AbsSeq& serial_time();
   static const AbsSeq& parallelizable_time();
 
